@@ -1,0 +1,434 @@
+# Full ML Pipeline: Data Prep -> Training -> Evaluation -> Serving
+# Multi-stage pipeline using YAML separator (---)
+# Each stage runs sequentially; later stages can reference earlier outputs.
+#
+# Usage:
+#   sky jobs launch full-pipeline.yaml
+#
+# Prerequisites:
+#   - WANDB_API_KEY in local env
+#   - HF_TOKEN in local env
+#   - S3 bucket for data and checkpoints
+
+# ============================================================================
+# Stage 1: Data Preparation
+# ============================================================================
+name: pipeline-data-prep
+
+resources:
+  cpus: 16+
+  memory: 64+
+  disk_size: 500
+  disk_tier: high
+  accelerators: null
+  cloud: aws
+
+envs:
+  HF_TOKEN: null
+  RAW_DATA_BUCKET: s3://YOUR_BUCKET/data/raw
+  CLEAN_DATA_BUCKET: s3://YOUR_BUCKET/data/clean
+  TOKENIZER_ID: meta-llama/Meta-Llama-3.1-8B
+
+file_mounts:
+  /data/raw:
+    source: s3://YOUR_BUCKET/data/raw
+    mode: MOUNT_CACHED
+  /data/clean:
+    source: s3://YOUR_BUCKET/data/clean
+    mode: MOUNT
+
+setup: |
+  pip install --upgrade pip
+  pip install datasets transformers ftfy nltk xxhash
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+  echo "=== Stage 1: Data Preparation ==="
+
+  python - <<'PYTHON_EOF'
+  import os
+  import json
+  from pathlib import Path
+  from datasets import load_dataset
+  from transformers import AutoTokenizer
+  import hashlib
+
+  raw_path = "/data/raw"
+  clean_path = "/data/clean"
+  tokenizer_id = os.environ["TOKENIZER_ID"]
+
+  print("Loading tokenizer...")
+  tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+
+  # Load raw data
+  print("Loading raw data...")
+  files = list(Path(raw_path).glob("*.jsonl"))
+  if not files:
+      print("No JSONL files found, generating sample data...")
+      ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+      files = [Path(clean_path) / "wikitext.jsonl"]
+      with open(files[0], "w") as f:
+          for item in ds:
+              if item["text"].strip():
+                  f.write(json.dumps({"text": item["text"]}) + "\n")
+
+  # Process and deduplicate
+  seen_hashes = set()
+  total = 0
+  kept = 0
+
+  output_file = Path(clean_path) / "train.jsonl"
+  with open(output_file, "w") as out:
+      for filepath in files:
+          with open(filepath) as f:
+              for line in f:
+                  total += 1
+                  doc = json.loads(line)
+                  text = doc.get("text", "").strip()
+
+                  # Length filter
+                  if len(text) < 50 or len(text) > 100000:
+                      continue
+
+                  # Dedup
+                  h = hashlib.md5(text.encode()).hexdigest()
+                  if h in seen_hashes:
+                      continue
+                  seen_hashes.add(h)
+
+                  # Token count
+                  tokens = tokenizer.encode(text)
+                  doc["num_tokens"] = len(tokens)
+                  out.write(json.dumps(doc) + "\n")
+                  kept += 1
+
+  print(f"Processed {total:,} documents, kept {kept:,} ({kept/max(total,1)*100:.1f}%)")
+  print(f"Output: {output_file}")
+  PYTHON_EOF
+
+  echo "=== Stage 1 complete ==="
+
+---
+# ============================================================================
+# Stage 2: Training
+# ============================================================================
+name: pipeline-training
+
+resources:
+  accelerators: H100:8
+  use_spot: true
+  disk_size: 512
+  disk_tier: best
+  any_of:
+    - cloud: aws
+      region: us-east-1
+    - cloud: gcp
+    - cloud: lambda
+
+envs:
+  WANDB_API_KEY: null
+  HF_TOKEN: null
+  MODEL_ID: meta-llama/Meta-Llama-3.1-8B
+  CHECKPOINT_DIR: /checkpoints/pipeline
+  MAX_STEPS: 2000
+  BATCH_SIZE: 4
+  GRADIENT_ACCUM: 4
+  LEARNING_RATE: "2e-5"
+
+file_mounts:
+  /data/clean:
+    source: s3://YOUR_BUCKET/data/clean
+    mode: MOUNT_CACHED
+  /checkpoints:
+    source: s3://YOUR_BUCKET/checkpoints/pipeline
+    mode: MOUNT
+
+setup: |
+  pip install --upgrade pip
+  pip install \
+    torch>=2.5.0 \
+    transformers>=4.46.0 \
+    accelerate \
+    datasets \
+    peft \
+    bitsandbytes \
+    wandb \
+    flash-attn
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+  echo "=== Stage 2: Training ==="
+
+  python - <<'PYTHON_EOF'
+  import os
+  import torch
+  from transformers import (
+      AutoModelForCausalLM,
+      AutoTokenizer,
+      TrainingArguments,
+      Trainer,
+      DataCollatorForLanguageModeling,
+  )
+  from datasets import load_dataset
+  from peft import LoraConfig, get_peft_model
+
+  model_id = os.environ["MODEL_ID"]
+  checkpoint_dir = os.environ["CHECKPOINT_DIR"]
+
+  print(f"Loading model: {model_id}")
+  tokenizer = AutoTokenizer.from_pretrained(model_id)
+  if tokenizer.pad_token is None:
+      tokenizer.pad_token = tokenizer.eos_token
+
+  model = AutoModelForCausalLM.from_pretrained(
+      model_id,
+      torch_dtype=torch.bfloat16,
+      attn_implementation="flash_attention_2",
+      device_map="auto",
+  )
+
+  # LoRA for efficient training
+  lora_config = LoraConfig(
+      r=32,
+      lora_alpha=64,
+      target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+      lora_dropout=0.05,
+      bias="none",
+      task_type="CAUSAL_LM",
+  )
+  model = get_peft_model(model, lora_config)
+  model.print_trainable_parameters()
+
+  # Load cleaned data
+  print("Loading cleaned data...")
+  dataset = load_dataset("json", data_files="/data/clean/train.jsonl", split="train")
+
+  def tokenize(examples):
+      return tokenizer(
+          examples["text"],
+          truncation=True,
+          max_length=4096,
+          padding=False,
+      )
+
+  dataset = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+
+  # Training
+  args = TrainingArguments(
+      output_dir=checkpoint_dir,
+      max_steps=int(os.environ["MAX_STEPS"]),
+      per_device_train_batch_size=int(os.environ["BATCH_SIZE"]),
+      gradient_accumulation_steps=int(os.environ["GRADIENT_ACCUM"]),
+      learning_rate=float(os.environ["LEARNING_RATE"]),
+      bf16=True,
+      logging_steps=10,
+      save_steps=500,
+      save_total_limit=3,
+      warmup_steps=100,
+      lr_scheduler_type="cosine",
+      gradient_checkpointing=True,
+      report_to="wandb",
+      run_name="pipeline-training",
+  )
+
+  trainer = Trainer(
+      model=model,
+      args=args,
+      train_dataset=dataset,
+      data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+  )
+
+  trainer.train()
+  trainer.save_model(checkpoint_dir)
+  tokenizer.save_pretrained(checkpoint_dir)
+  print(f"Model saved to {checkpoint_dir}")
+  PYTHON_EOF
+
+  echo "=== Stage 2 complete ==="
+
+---
+# ============================================================================
+# Stage 3: Evaluation
+# ============================================================================
+name: pipeline-eval
+
+resources:
+  accelerators: A100:1
+  use_spot: true
+  disk_size: 256
+  disk_tier: high
+  any_of:
+    - cloud: aws
+    - cloud: gcp
+
+envs:
+  HF_TOKEN: null
+  MODEL_DIR: /checkpoints/pipeline
+  EVAL_OUTPUT: /checkpoints/pipeline/eval_results.json
+
+file_mounts:
+  /checkpoints:
+    source: s3://YOUR_BUCKET/checkpoints/pipeline
+    mode: MOUNT
+
+setup: |
+  pip install --upgrade pip
+  pip install \
+    torch>=2.5.0 \
+    transformers>=4.46.0 \
+    peft \
+    datasets \
+    lm-eval>=0.4.0
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+  echo "=== Stage 3: Evaluation ==="
+
+  python - <<'PYTHON_EOF'
+  import os
+  import json
+  import torch
+  from transformers import AutoModelForCausalLM, AutoTokenizer
+  from peft import PeftModel
+
+  model_dir = os.environ["MODEL_DIR"]
+  eval_output = os.environ["EVAL_OUTPUT"]
+
+  print(f"Loading model from {model_dir}...")
+  tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+  # Basic generation quality check
+  model = AutoModelForCausalLM.from_pretrained(
+      model_dir,
+      torch_dtype=torch.bfloat16,
+      device_map="auto",
+  )
+
+  eval_prompts = [
+      "The capital of France is",
+      "def fibonacci(n):",
+      "Explain quantum computing in simple terms:",
+      "Write a haiku about machine learning:",
+      "The three laws of thermodynamics are:",
+  ]
+
+  results = {"generations": [], "perplexity": None}
+
+  print("\n--- Generation Samples ---")
+  for prompt in eval_prompts:
+      inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+      with torch.no_grad():
+          outputs = model.generate(
+              **inputs,
+              max_new_tokens=100,
+              temperature=0.7,
+              do_sample=True,
+              top_p=0.9,
+          )
+      generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+      print(f"\nPrompt: {prompt}")
+      print(f"Output: {generated[:200]}")
+      results["generations"].append({
+          "prompt": prompt,
+          "output": generated[:500],
+      })
+
+  # Perplexity on held-out data
+  print("\n--- Perplexity Evaluation ---")
+  from datasets import load_dataset
+  eval_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+  eval_text = "\n".join([t for t in eval_data["text"] if t.strip()][:100])
+
+  encodings = tokenizer(eval_text, return_tensors="pt", truncation=True, max_length=2048)
+  with torch.no_grad():
+      outputs = model(**encodings.to(model.device), labels=encodings["input_ids"].to(model.device))
+      perplexity = torch.exp(outputs.loss).item()
+
+  results["perplexity"] = perplexity
+  print(f"Perplexity: {perplexity:.2f}")
+
+  # Gate check: perplexity must be under 50 to proceed to serving
+  results["gate_passed"] = perplexity < 50
+  if results["gate_passed"]:
+      print("GATE PASSED: Model quality acceptable for serving")
+  else:
+      print(f"GATE FAILED: Perplexity {perplexity:.2f} > 50 threshold")
+
+  with open(eval_output, "w") as f:
+      json.dump(results, f, indent=2)
+  print(f"\nResults written to {eval_output}")
+  PYTHON_EOF
+
+  echo "=== Stage 3 complete ==="
+
+---
+# ============================================================================
+# Stage 4: Serving (SkyServe)
+# ============================================================================
+name: pipeline-serve
+
+resources:
+  accelerators: A100:1
+  disk_size: 256
+  disk_tier: high
+  ports:
+    - 8000
+  any_of:
+    - cloud: aws
+    - cloud: gcp
+
+envs:
+  HF_TOKEN: null
+  MODEL_DIR: /checkpoints/pipeline
+  MAX_MODEL_LEN: 4096
+
+file_mounts:
+  /checkpoints:
+    source: s3://YOUR_BUCKET/checkpoints/pipeline
+    mode: MOUNT_CACHED
+
+service:
+  readiness_probe:
+    path: /v1/models
+    initial_delay_seconds: 180
+  replicas: 1
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 2
+    target_qps_per_replica: 5
+    upscale_delay_seconds: 120
+    downscale_delay_seconds: 600
+
+setup: |
+  pip install --upgrade pip
+  pip install vllm>=0.6.0 peft
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+  echo "=== Stage 4: Serving ==="
+
+  # Check eval gate
+  if [ -f /checkpoints/pipeline/eval_results.json ]; then
+    GATE=$(python -c "import json; r=json.load(open('/checkpoints/pipeline/eval_results.json')); print('PASS' if r.get('gate_passed', False) else 'FAIL')")
+    if [ "$GATE" = "FAIL" ]; then
+      echo "ERROR: Evaluation gate failed. Model quality too low for serving."
+      echo "Check /checkpoints/pipeline/eval_results.json for details."
+      exit 1
+    fi
+    echo "Evaluation gate passed, proceeding to serve..."
+  fi
+
+  python -m vllm.entrypoints.openai.api_server \
+    --model ${MODEL_DIR} \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --max-model-len ${MAX_MODEL_LEN} \
+    --gpu-memory-utilization 0.90 \
+    --dtype bfloat16 \
+    --enable-prefix-caching \
+    --enable-lora \
+    --disable-log-requests

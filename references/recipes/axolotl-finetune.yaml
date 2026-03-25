@@ -1,0 +1,142 @@
+# Axolotl LoRA/QLoRA Fine-Tuning
+# Framework: Axolotl (YAML-driven fine-tuning)
+# Scale: Single node, 1x A100/H100
+# Features: QLoRA, S3 dataset mount, checkpoint persistence, W&B logging
+#
+# Usage:
+#   sky jobs launch axolotl-finetune.yaml
+#
+# Prerequisites:
+#   - WANDB_API_KEY in local env
+#   - HF_TOKEN in local env
+#   - Dataset in S3 bucket (JSONL format)
+
+name: axolotl-finetune
+
+resources:
+  accelerators: A100:1
+  use_spot: true
+  disk_size: 256
+  disk_tier: high
+  any_of:
+    - cloud: aws
+    - cloud: gcp
+    - cloud: lambda
+
+envs:
+  WANDB_API_KEY: null
+  HF_TOKEN: null
+  BASE_MODEL: meta-llama/Meta-Llama-3.1-8B-Instruct
+  DATASET_PATH: /data/train.jsonl
+  OUTPUT_DIR: /checkpoints/axolotl-lora
+  NUM_EPOCHS: 3
+  LEARNING_RATE: "2e-4"
+  LORA_R: 32
+  LORA_ALPHA: 64
+  MICRO_BATCH_SIZE: 2
+  GRADIENT_ACCUM: 4
+  SEQUENCE_LEN: 4096
+  QUANTIZE: "true"
+
+file_mounts:
+  /data:
+    source: s3://YOUR_BUCKET/datasets/finetune
+    mode: MOUNT_CACHED
+  /checkpoints:
+    source: s3://YOUR_BUCKET/checkpoints/axolotl
+    mode: MOUNT
+
+setup: |
+  # Install Axolotl and dependencies
+  pip install --upgrade pip
+  pip install axolotl[flash-attn] wandb
+
+  # Verify GPU
+  python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}, VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')"
+
+  # Write Axolotl config
+  cat > /tmp/axolotl-config.yaml <<'AXOLOTL_EOF'
+  base_model: ${BASE_MODEL}
+  model_type: AutoModelForCausalLM
+  tokenizer_type: AutoTokenizer
+  trust_remote_code: true
+
+  # QLoRA config
+  load_in_4bit: ${QUANTIZE}
+  adapter: qlora
+  lora_r: ${LORA_R}
+  lora_alpha: ${LORA_ALPHA}
+  lora_dropout: 0.05
+  lora_target_linear: true
+
+  # Dataset
+  datasets:
+    - path: ${DATASET_PATH}
+      type: alpaca
+      ds_type: json
+  dataset_prepared_path: /tmp/prepared
+
+  # Training
+  sequence_len: ${SEQUENCE_LEN}
+  sample_packing: true
+  pad_to_sequence_len: true
+  micro_batch_size: ${MICRO_BATCH_SIZE}
+  gradient_accumulation_steps: ${GRADIENT_ACCUM}
+  num_epochs: ${NUM_EPOCHS}
+
+  # Optimizer
+  optimizer: adamw_bnb_8bit
+  lr_scheduler: cosine
+  learning_rate: ${LEARNING_RATE}
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+
+  # Precision
+  bf16: auto
+  flash_attention: true
+  tf32: true
+
+  # Logging
+  wandb_project: axolotl-finetune
+  wandb_run_id:
+  logging_steps: 5
+  eval_steps: 100
+  save_steps: 200
+  save_total_limit: 3
+
+  # Output
+  output_dir: ${OUTPUT_DIR}
+
+  # Performance
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  AXOLOTL_EOF
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+
+  echo "=== Axolotl Fine-Tuning ==="
+  echo "Model: ${BASE_MODEL}"
+  echo "Dataset: ${DATASET_PATH}"
+  echo "QLoRA: r=${LORA_R}, alpha=${LORA_ALPHA}"
+  echo "Epochs: ${NUM_EPOCHS}, LR: ${LEARNING_RATE}"
+
+  # Substitute env vars in config
+  envsubst < /tmp/axolotl-config.yaml > /tmp/axolotl-resolved.yaml
+
+  # Run Axolotl training
+  accelerate launch -m axolotl.cli.train /tmp/axolotl-resolved.yaml
+
+  echo "=== Fine-tuning complete ==="
+  echo "Checkpoints saved to: ${OUTPUT_DIR}"
+
+  # Merge LoRA weights for deployment
+  if [ "${QUANTIZE}" = "true" ]; then
+    echo "Merging LoRA weights..."
+    python -m axolotl.cli.merge_lora /tmp/axolotl-resolved.yaml \
+      --lora_model_dir="${OUTPUT_DIR}" \
+      --output_dir="${OUTPUT_DIR}/merged"
+    echo "Merged model saved to: ${OUTPUT_DIR}/merged"
+  fi

@@ -1,0 +1,147 @@
+# torchtune Full Fine-Tuning with FSDP2 + torch.compile
+# Framework: torchtune (PyTorch-native fine-tuning)
+# Scale: Single node, 8x GPU, FSDP2 sharding
+# Features: torch.compile, activation checkpointing, W&B logging
+#
+# Usage:
+#   sky jobs launch torchtune-finetune.yaml
+#
+# Prerequisites:
+#   - WANDB_API_KEY in local env
+#   - HF_TOKEN in local env
+
+name: torchtune-finetune
+
+resources:
+  accelerators: H100:8
+  use_spot: true
+  disk_size: 512
+  disk_tier: high
+  any_of:
+    - cloud: aws
+      region: us-east-1
+    - cloud: gcp
+    - cloud: lambda
+
+envs:
+  WANDB_API_KEY: null
+  HF_TOKEN: null
+  MODEL_ID: meta-llama/Meta-Llama-3.1-8B
+  DATASET_NAME: tatsu-lab/alpaca
+  MAX_STEPS: 5000
+  BATCH_SIZE: 2
+  GRADIENT_ACCUM: 4
+  LEARNING_RATE: "2e-5"
+  SEQ_LENGTH: 4096
+  ENABLE_COMPILE: "true"
+
+file_mounts:
+  /checkpoints:
+    source: s3://YOUR_BUCKET/checkpoints/torchtune
+    mode: MOUNT
+
+setup: |
+  # Install torchtune and dependencies
+  pip install --upgrade pip
+  pip install \
+    torchtune \
+    torch>=2.5.0 \
+    wandb \
+    datasets
+
+  # Download model weights
+  tune download ${MODEL_ID} \
+    --output-dir /tmp/model \
+    --hf-token ${HF_TOKEN}
+
+  # Write torchtune recipe config
+  cat > /tmp/tune-config.yaml <<'CONFIG_EOF'
+  # Model
+  model:
+    _component_: torchtune.models.llama3_1.llama3_1_8b
+
+  # Tokenizer
+  tokenizer:
+    _component_: torchtune.models.llama3.llama3_tokenizer
+    path: /tmp/model/original/tokenizer.model
+    max_seq_len: 4096
+
+  # Checkpointer
+  checkpointer:
+    _component_: torchtune.training.FullModelHFCheckpointer
+    checkpoint_dir: /tmp/model
+    output_dir: /checkpoints/torchtune
+    checkpoint_files:
+      - model-00001-of-00004.safetensors
+      - model-00002-of-00004.safetensors
+      - model-00003-of-00004.safetensors
+      - model-00004-of-00004.safetensors
+    recipe_checkpoint: null
+
+  # Dataset
+  dataset:
+    _component_: torchtune.datasets.alpaca_cleaned_dataset
+    packed: true
+
+  # Training
+  seed: 42
+  shuffle: true
+  batch_size: 2
+  epochs: 1
+  max_steps_per_epoch: 5000
+  gradient_accumulation_steps: 4
+
+  # Optimizer
+  optimizer:
+    _component_: torch.optim.AdamW
+    lr: 2e-5
+    weight_decay: 0.01
+    fused: true
+
+  lr_scheduler:
+    _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+    num_warmup_steps: 100
+
+  # Performance
+  compile: true
+  enable_activation_checkpointing: true
+  dtype: bf16
+
+  # Logging
+  metric_logger:
+    _component_: torchtune.training.metric_logging.WandBLogger
+    project: torchtune-finetune
+
+  log_every_n_steps: 10
+  log_peak_memory_stats: true
+
+  # Profiler (optional)
+  profiler:
+    _component_: torchtune.training.setup_torch_profiler
+    enabled: false
+  CONFIG_EOF
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+
+  echo "=== torchtune Full Fine-Tuning ==="
+  echo "Model: ${MODEL_ID}"
+  echo "GPUs: ${SKYPILOT_NUM_GPUS_PER_NODE}"
+  echo "Compile: ${ENABLE_COMPILE}"
+  echo "Max steps: ${MAX_STEPS}"
+
+  # Run distributed training with FSDP2
+  tune run \
+    --nproc_per_node ${SKYPILOT_NUM_GPUS_PER_NODE} \
+    full_finetune_distributed \
+    --config /tmp/tune-config.yaml \
+    batch_size=${BATCH_SIZE} \
+    gradient_accumulation_steps=${GRADIENT_ACCUM} \
+    optimizer.lr=${LEARNING_RATE} \
+    max_steps_per_epoch=${MAX_STEPS} \
+    compile=${ENABLE_COMPILE} \
+    tokenizer.max_seq_len=${SEQ_LENGTH}
+
+  echo "=== Fine-tuning complete ==="
+  echo "Checkpoints saved to: /checkpoints/torchtune"

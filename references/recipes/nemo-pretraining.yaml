@@ -1,0 +1,151 @@
+# NeMo 2.0 Multi-Node Pretraining on H100 Cluster
+# Framework: NVIDIA NeMo 2.0 with Megatron-Core
+# Scale: 4 nodes x 8 H100s (32 GPUs total)
+# Features: Distributed checkpointing, W&B logging, spot with auto-recovery
+#
+# Usage:
+#   sky jobs launch nemo-pretraining.yaml
+#
+# Prerequisites:
+#   - WANDB_API_KEY in local env
+#   - HF_TOKEN in local env (for gated model access)
+#   - S3 bucket for checkpoints (update YOUR_BUCKET below)
+
+name: nemo-pretrain
+
+resources:
+  accelerators: H100:8
+  use_spot: true
+  disk_size: 1000
+  disk_tier: best
+  any_of:
+    - cloud: aws
+      region: us-east-1
+    - cloud: gcp
+      region: us-central1
+    - cloud: lambda
+
+num_nodes: 4
+
+envs:
+  WANDB_API_KEY: null
+  HF_TOKEN: null
+  NEMO_CHECKPOINT_BUCKET: s3://YOUR_BUCKET/nemo-checkpoints
+  MODEL_SIZE: "7b"
+  MAX_STEPS: 100000
+  GLOBAL_BATCH_SIZE: 512
+  MICRO_BATCH_SIZE: 2
+  TP_SIZE: 4
+  PP_SIZE: 2
+  CP_SIZE: 1
+  SEQ_LENGTH: 8192
+  TOKENIZER: meta-llama/Meta-Llama-3-8B
+
+file_mounts:
+  /data:
+    source: s3://YOUR_BUCKET/training-data
+    mode: MOUNT_CACHED
+  /checkpoints:
+    source: s3://YOUR_BUCKET/nemo-checkpoints
+    mode: MOUNT
+
+setup: |
+  # Install NeMo 2.0 and dependencies
+  pip install --upgrade pip
+  pip install \
+    nemo_toolkit[all]>=2.0.0 \
+    nemo-run \
+    megatron-core \
+    transformer-engine \
+    flash-attn \
+    wandb \
+    s3fs
+
+  # Verify NCCL and GPU connectivity
+  python -c "import torch; print(f'GPUs: {torch.cuda.device_count()}, NCCL: {torch.cuda.nccl.version()}')"
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+
+  NUM_NODES=${SKYPILOT_NUM_NODES}
+  GPUS_PER_NODE=${SKYPILOT_NUM_GPUS_PER_NODE}
+  WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
+
+  echo "=== NeMo 2.0 Pretraining ==="
+  echo "Nodes: ${NUM_NODES}, GPUs/node: ${GPUS_PER_NODE}, World size: ${WORLD_SIZE}"
+  echo "TP=${TP_SIZE}, PP=${PP_SIZE}, CP=${CP_SIZE}"
+  echo "GBS=${GLOBAL_BATCH_SIZE}, MBS=${MICRO_BATCH_SIZE}, Seq=${SEQ_LENGTH}"
+
+  # NeMo-Run based launcher
+  python - <<'PYTHON_EOF'
+  import nemo_run as run
+  from nemo.collections.llm import GPTModel, PretrainingDataModule
+  from nemo.collections.llm.recipes import llama3_8b
+  from nemo.lightning import NeMoTrainer, MegatronStrategy
+  from nemo.lightning.pytorch.callbacks import ModelCheckpoint
+  from nemo.utils.exp_manager import exp_manager
+  import os
+
+  # Parallelism config
+  strategy = MegatronStrategy(
+      tensor_model_parallel_size=int(os.environ["TP_SIZE"]),
+      pipeline_model_parallel_size=int(os.environ["PP_SIZE"]),
+      context_parallel_size=int(os.environ["CP_SIZE"]),
+      sequence_parallel=True,
+      gradient_as_bucket_view=True,
+      use_distributed_optimizer=True,
+  )
+
+  # Checkpointing
+  checkpoint_callback = ModelCheckpoint(
+      save_top_k=3,
+      monitor="val_loss",
+      mode="min",
+      save_last=True,
+      every_n_train_steps=500,
+      dirpath="/checkpoints/nemo",
+      save_on_train_epoch_end=False,
+      async_save=True,
+  )
+
+  # Trainer
+  trainer = NeMoTrainer(
+      strategy=strategy,
+      max_steps=int(os.environ["MAX_STEPS"]),
+      val_check_interval=500,
+      log_every_n_steps=10,
+      callbacks=[checkpoint_callback],
+      enable_progress_bar=True,
+  )
+
+  # Data
+  data = PretrainingDataModule(
+      paths=["/data"],
+      seq_length=int(os.environ["SEQ_LENGTH"]),
+      global_batch_size=int(os.environ["GLOBAL_BATCH_SIZE"]),
+      micro_batch_size=int(os.environ["MICRO_BATCH_SIZE"]),
+      tokenizer_path=os.environ["TOKENIZER"],
+  )
+
+  # Model
+  model = llama3_8b.model()
+
+  # W&B logging
+  exp_manager(
+      trainer,
+      {
+          "name": f"nemo-pretrain-{os.environ['MODEL_SIZE']}",
+          "create_wandb_logger": True,
+          "wandb_logger_kwargs": {
+              "project": "nemo-pretraining",
+              "name": f"pretrain-{os.environ['MODEL_SIZE']}-{os.environ['MAX_STEPS']}steps",
+          },
+      },
+  )
+
+  # Train
+  trainer.fit(model, data)
+  PYTHON_EOF
+
+  echo "=== Pretraining complete ==="

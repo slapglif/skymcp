@@ -1,0 +1,8 @@
+**/node_modules/
+bun.lock
+.letta/
+.omc/
+.claude/
+/tmp/
+*.local.md
+mcp/dist/*.js.map

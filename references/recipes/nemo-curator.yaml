@@ -1,0 +1,213 @@
+# NeMo Curator Data Pipeline
+# Framework: NVIDIA NeMo Curator
+# Scale: CPU-heavy (32+ vCPUs, no GPU needed)
+# Features: Deduplication, quality filtering, language detection, PII removal
+#
+# Usage:
+#   sky jobs launch nemo-curator.yaml
+#
+# Prerequisites:
+#   - Raw data in S3 bucket (JSONL format with "text" field)
+#   - Output bucket for cleaned data
+
+name: nemo-curator-pipeline
+
+resources:
+  cpus: 32+
+  memory: 128+
+  disk_size: 2000
+  disk_tier: best
+  accelerators: null
+  cloud: aws
+
+envs:
+  INPUT_PATH: /data/raw
+  OUTPUT_PATH: /data/cleaned
+  LANGUAGE: en
+  MIN_QUALITY_SCORE: "0.7"
+  MIN_DOC_LENGTH: 100
+  MAX_DOC_LENGTH: 100000
+  FUZZY_DEDUP_THRESHOLD: "0.8"
+  NUM_WORKERS: 32
+
+file_mounts:
+  /data/raw:
+    source: s3://YOUR_BUCKET/data/raw
+    mode: MOUNT_CACHED
+  /data/cleaned:
+    source: s3://YOUR_BUCKET/data/cleaned
+    mode: MOUNT
+
+setup: |
+  pip install --upgrade pip
+  pip install \
+    nemo-curator[all] \
+    dask[distributed] \
+    fasttext \
+    ftfy \
+    nltk \
+    pyspark \
+    xxhash
+
+  # Download language detection model
+  python -c "
+  import fasttext
+  import urllib.request
+  import os
+  model_path = '/tmp/lid.176.bin'
+  if not os.path.exists(model_path):
+      urllib.request.urlretrieve(
+          'https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin',
+          model_path,
+      )
+      print('Language model downloaded')
+  "
+
+  # Download NLTK data
+  python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)"
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+
+  echo "=== NeMo Curator Data Pipeline ==="
+  echo "Input: ${INPUT_PATH}"
+  echo "Output: ${OUTPUT_PATH}"
+  echo "Workers: ${NUM_WORKERS}"
+  echo "Language: ${LANGUAGE}"
+  echo "Quality threshold: ${MIN_QUALITY_SCORE}"
+  echo "Dedup threshold: ${FUZZY_DEDUP_THRESHOLD}"
+
+  python - <<'PYTHON_EOF'
+  import os
+  import json
+  from pathlib import Path
+
+  # NeMo Curator pipeline stages
+  from nemo_curator import Sequential
+  from nemo_curator.datasets import DocumentDataset
+  from nemo_curator.filters import (
+      WordCountFilter,
+      RepetitiousDocumentFilter,
+      NonAlphaNumericFilter,
+      UrlsFilter,
+  )
+  from nemo_curator.modules import (
+      ExactDuplicates,
+      FuzzyDuplicates,
+      ScoreFilter,
+  )
+  from nemo_curator.modules.config import FuzzyDuplicatesConfig
+  from nemo_curator.utils.distributed_utils import get_client
+
+  input_path = os.environ["INPUT_PATH"]
+  output_path = os.environ["OUTPUT_PATH"]
+  num_workers = int(os.environ["NUM_WORKERS"])
+  min_quality = float(os.environ["MIN_QUALITY_SCORE"])
+  min_length = int(os.environ["MIN_DOC_LENGTH"])
+  max_length = int(os.environ["MAX_DOC_LENGTH"])
+  dedup_threshold = float(os.environ["FUZZY_DEDUP_THRESHOLD"])
+
+  print("Starting Dask cluster...")
+  client = get_client(n_workers=num_workers)
+  print(f"Dask dashboard: {client.dashboard_link}")
+
+  # Load dataset
+  print(f"Loading data from {input_path}...")
+  dataset = DocumentDataset.read_json(input_path, add_filename=True)
+  initial_count = len(dataset)
+  print(f"Loaded {initial_count:,} documents")
+
+  # Stage 1: Unicode and text normalization
+  print("\n=== Stage 1: Text Normalization ===")
+  from nemo_curator.modules import Modify
+  from nemo_curator.modifiers import UnicodeReformatter
+  dataset = Modify(UnicodeReformatter())(dataset)
+
+  # Stage 2: Language filtering
+  print("\n=== Stage 2: Language Filtering ===")
+  from nemo_curator.filters import FastTextLangId
+  lang_filter = ScoreFilter(
+      FastTextLangId(model_path="/tmp/lid.176.bin"),
+      score_field="language_score",
+      score_threshold=0.65,
+  )
+  dataset = lang_filter(dataset)
+  print(f"After language filter: {len(dataset):,} documents")
+
+  # Stage 3: Quality filtering
+  print("\n=== Stage 3: Quality Filtering ===")
+  quality_pipeline = Sequential([
+      ScoreFilter(WordCountFilter(min_words=20), score_threshold=1.0),
+      ScoreFilter(
+          RepetitiousDocumentFilter(top_n_grams=[2, 3, 4]),
+          score_threshold=0.3,
+          score_type="max",
+          invert=True,
+      ),
+      ScoreFilter(
+          NonAlphaNumericFilter(),
+          score_threshold=0.5,
+          invert=True,
+      ),
+  ])
+  dataset = quality_pipeline(dataset)
+  print(f"After quality filter: {len(dataset):,} documents")
+
+  # Stage 4: Exact deduplication
+  print("\n=== Stage 4: Exact Deduplication ===")
+  exact_dedup = ExactDuplicates(
+      id_field="id",
+      text_field="text",
+      hash_method="md5",
+  )
+  dataset = exact_dedup(dataset)
+  print(f"After exact dedup: {len(dataset):,} documents")
+
+  # Stage 5: Fuzzy deduplication (MinHash LSH)
+  print("\n=== Stage 5: Fuzzy Deduplication ===")
+  fuzzy_config = FuzzyDuplicatesConfig(
+      seed=42,
+      char_ngrams=25,
+      num_buckets=20,
+      hashes_per_bucket=13,
+      use_64_bit_hash=False,
+      jaccard_threshold=dedup_threshold,
+  )
+  fuzzy_dedup = FuzzyDuplicates(
+      config=fuzzy_config,
+      id_field="id",
+      text_field="text",
+  )
+  dataset = fuzzy_dedup(dataset)
+  print(f"After fuzzy dedup: {len(dataset):,} documents")
+
+  # Stage 6: PII removal
+  print("\n=== Stage 6: PII Scrubbing ===")
+  from nemo_curator.modules import Modify
+  from nemo_curator.modifiers.pii_modifier import PiiModifier
+  pii_modifier = PiiModifier(
+      supported_entities=[
+          "EMAIL_ADDRESS", "PHONE_NUMBER", "PERSON",
+          "CREDIT_CARD", "US_SSN", "IP_ADDRESS",
+      ],
+      anonymize_action="replace",
+  )
+  dataset = Modify(pii_modifier)(dataset)
+
+  # Write output
+  print(f"\nWriting cleaned data to {output_path}...")
+  dataset.to_json(output_path)
+
+  final_count = len(dataset)
+  removed = initial_count - final_count
+  pct = (removed / initial_count * 100) if initial_count > 0 else 0
+  print(f"\n=== Pipeline Complete ===")
+  print(f"Input:   {initial_count:>10,} documents")
+  print(f"Output:  {final_count:>10,} documents")
+  print(f"Removed: {removed:>10,} documents ({pct:.1f}%)")
+
+  client.close()
+  PYTHON_EOF
+
+  echo "=== NeMo Curator pipeline complete ==="

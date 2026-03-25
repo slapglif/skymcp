@@ -1,0 +1,31 @@
+{
+  "name": "skymcp",
+  "version": "0.1.0",
+  "description": "End-to-end ML training ecosystem powered by SkyPilot. Launch, monitor, fix, iterate, ablate, and serve models on any cloud GPU with production-grade frameworks.",
+  "author": {
+    "name": "slapglif",
+    "url": "https://github.com/slapglif"
+  },
+  "repository": "https://github.com/slapglif/skymcp",
+  "keywords": [
+    "skypilot",
+    "ml-training",
+    "gpu",
+    "cloud",
+    "distributed-training",
+    "fine-tuning",
+    "llm",
+    "mlops",
+    "nemo",
+    "axolotl",
+    "torchtune",
+    "vllm"
+  ],
+  "license": "MIT",
+  "mcpServers": {
+    "skypilot": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/dist/index.js"]
+    }
+  }
+}

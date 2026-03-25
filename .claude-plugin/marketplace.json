@@ -1,0 +1,39 @@
+{
+  "name": "skymcp",
+  "title": "SkyMCP — SkyPilot ML Training Ecosystem",
+  "description": "End-to-end ML training platform for Claude Code. Launch, monitor, fix, iterate, ablate, and serve models on any cloud GPU using SkyPilot with production-grade frameworks (NeMo, Axolotl, torchtune, TRL, DeepSpeed, vLLM).",
+  "version": "0.1.0",
+  "author": "slapglif",
+  "repository": "https://github.com/slapglif/skymcp",
+  "license": "MIT",
+  "category": "ml-training",
+  "tags": [
+    "skypilot",
+    "ml-training",
+    "gpu",
+    "cloud",
+    "distributed-training",
+    "fine-tuning",
+    "llm",
+    "mlops",
+    "nemo",
+    "axolotl",
+    "torchtune",
+    "vllm",
+    "deepspeed",
+    "evaluation",
+    "serving"
+  ],
+  "components": {
+    "skills": 17,
+    "agents": 5,
+    "hooks": 3,
+    "mcpServers": 1,
+    "recipes": 7
+  },
+  "prerequisites": [
+    "SkyPilot CLI (pip install skypilot)",
+    "Cloud credentials (sky check)",
+    "Node.js 18+"
+  ]
+}

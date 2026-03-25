@@ -1,0 +1,89 @@
+# vLLM SkyServe Deployment with Autoscaling
+# Framework: vLLM (PagedAttention inference engine)
+# Scale: 1-4 replicas, autoscaling on QPS
+# Features: Readiness probe, rolling updates, load balancing
+#
+# Usage:
+#   sky serve up vllm-serve.yaml -n my-llm-service
+#
+# Prerequisites:
+#   - HF_TOKEN in local env (for gated models)
+#
+# Access:
+#   After deploy, get endpoint via: sky serve status
+#   Test: curl <endpoint>/v1/models
+
+name: vllm-inference
+
+resources:
+  accelerators: A100:1
+  disk_size: 256
+  disk_tier: high
+  ports:
+    - 8000
+  any_of:
+    - cloud: aws
+    - cloud: gcp
+    - cloud: lambda
+
+envs:
+  HF_TOKEN: null
+  MODEL_ID: meta-llama/Meta-Llama-3.1-8B-Instruct
+  MAX_MODEL_LEN: 8192
+  GPU_MEMORY_UTILIZATION: "0.90"
+  MAX_NUM_SEQS: 128
+  TENSOR_PARALLEL_SIZE: 1
+
+service:
+  readiness_probe:
+    path: /v1/models
+    initial_delay_seconds: 300
+    post_data:
+  replicas: 1
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 4
+    target_qps_per_replica: 5
+    upscale_delay_seconds: 120
+    downscale_delay_seconds: 600
+
+setup: |
+  pip install --upgrade pip
+  pip install \
+    vllm>=0.6.0 \
+    huggingface_hub
+
+  # Pre-download model weights during setup (not during serve)
+  python -c "
+  from huggingface_hub import snapshot_download
+  import os
+  snapshot_download(
+      os.environ['MODEL_ID'],
+      token=os.environ.get('HF_TOKEN'),
+      local_dir='/tmp/model-cache',
+  )
+  print('Model downloaded successfully')
+  "
+
+run: |
+  #!/bin/bash
+  set -euo pipefail
+
+  echo "=== vLLM Inference Server ==="
+  echo "Model: ${MODEL_ID}"
+  echo "Max seq len: ${MAX_MODEL_LEN}"
+  echo "GPU memory util: ${GPU_MEMORY_UTILIZATION}"
+  echo "TP size: ${TENSOR_PARALLEL_SIZE}"
+
+  python -m vllm.entrypoints.openai.api_server \
+    --model /tmp/model-cache \
+    --served-model-name ${MODEL_ID} \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --max-model-len ${MAX_MODEL_LEN} \
+    --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION} \
+    --max-num-seqs ${MAX_NUM_SEQS} \
+    --tensor-parallel-size ${TENSOR_PARALLEL_SIZE} \
+    --dtype bfloat16 \
+    --enable-prefix-caching \
+    --disable-log-requests
