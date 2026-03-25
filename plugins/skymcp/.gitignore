@@ -3,7 +3,6 @@ bun.lock
 .letta/
 .omc/
 .claude/
-!/home/mikeb/skymcp/.claude-plugin/
 /tmp/
 *.local.md
-**/*.js.map
+mcp/dist/*.js.map
