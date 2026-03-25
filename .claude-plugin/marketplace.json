@@ -1,7 +1,5 @@
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "skymcp-marketplace",
-  "description": "SkyPilot ML Training Ecosystem — launch, monitor, fix, iterate, ablate, and serve models on any cloud GPU with production-grade frameworks",
   "owner": {
     "name": "slapglif",
     "email": "slapglif@users.noreply.github.com"
